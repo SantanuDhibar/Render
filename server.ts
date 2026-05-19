@@ -4,7 +4,7 @@
 const UUID: string = Deno.env.get("UUID") || "f9a1ba12-7187-4b25-a5d5-7bafd82ffb4d";
 const SUB_PATH: string = Deno.env.get("SUB_PATH") || "sub";  // Get subscription path
 const XPATH: string = Deno.env.get("XPATH") || "xhttp";      // Node path
-const DOMAIN: string = Deno.env.get("DOMAIN") || "render-pdj5.onrender.com";         // Your Render domain (required)
+const DOMAIN: string = Deno.env.get("DOMAIN") || "";         // Your Render domain (required)
 const NAME: string = Deno.env.get("NAME") || "Render";
 const PORT: number = parseInt(Deno.env.get("PORT") || "8080"); // Render uses 8080 by default
 const SSH_PATH: string = Deno.env.get("SSH_PATH") || "ssh";   // SSH WebSocket path
@@ -638,6 +638,7 @@ Deno.serve({ port: PORT }, async (req: Request): Promise<Response> => {
     });
   }
 
+
   // VLESS XHTTP endpoint
   const pathMatch = path.match(new RegExp(`/${XPATH}/([^/]+)(?:/([0-9]+))?$`));
   if (!pathMatch) {
@@ -654,4 +655,46 @@ Deno.serve({ port: PORT }, async (req: Request): Promise<Response> => {
       sessions.set(uuid, session);
     }
 
-    session.do
+    session.downstreamStarted = true;
+    const { readable, writable } = new TransformStream();
+    session.startDownstream({ writable });
+
+    return new Response(readable, {
+      status: 200,
+      headers: {
+        ...headers,
+        "Content-Type": "application/octet-stream",
+        "Transfer-Encoding": "chunked",
+      },
+    });
+  }
+
+  if (req.method === "POST" && seq !== null) {
+    let session = sessions.get(uuid);
+    if (!session) {
+      session = new Session(uuid);
+      sessions.set(uuid, session);
+
+      setTimeout(() => {
+        const currentSession = sessions.get(uuid);
+        if (currentSession && !currentSession.downstreamStarted) {
+          currentSession.cleanup();
+          sessions.delete(uuid);
+        }
+      }, SETTINGS.SESSION_TIMEOUT);
+    }
+
+    const data = await req.arrayBuffer();
+    const buffer = new Uint8Array(data);
+
+    try {
+      await session.processPacket(seq, buffer);
+      return new Response(null, { status: 200, headers });
+    } catch (err) {
+      session.cleanup();
+      sessions.delete(uuid);
+      return new Response(null, { status: 500 });
+    }
+  }
+  return new Response("Not Found", { status: 404 });
+});
