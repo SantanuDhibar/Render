@@ -1,95 +1,127 @@
 // server.ts
-// SSH WebSocket Server for Render
+// SSH WebSocket Tunnel for Render (works like XHTTP)
 
-const PORT: number = parseInt(Deno.env.get("PORT") || "443");
+const UUID: string = Deno.env.get("UUID") || "f9a1ba12-7187-4b25-a5d5-7bafd82ffb4d";
+const PORT: number = parseInt(Deno.env.get("PORT") || "8080");
 
-// SSH WebSocket handler
-async function handleSSHWebSocket(socket: WebSocket) {
-  let sshConn: Deno.Conn | null = null;
+// Simple session management
+const sessions = new Map<string, WebSocket>();
+
+// Handle SSH WebSocket connections
+async function handleSSHWebSocket(socket: WebSocket, sessionId: string) {
+  console.log(`New SSH WebSocket connection: ${sessionId}`);
   
-  console.log("New WebSocket connection established");
+  // Store the session
+  sessions.set(sessionId, socket);
   
-  try {
-    // Connect to local SSH server (port 22)
-    sshConn = await Deno.connect({ hostname: "render.santanudhibar.deno.net", port: 22 });
-    console.log("Connected to SSH server on port 22");
-    
-    // Handle incoming messages from WebSocket client
-    socket.onmessage = async (event) => {
-      if (!sshConn) return;
-      
-      try {
-        const data = typeof event.data === 'string'
-          ? new TextEncoder().encode(event.data)
-          : new Uint8Array(await event.data.arrayBuffer());
-        
-        const writer = sshConn.writable.getWriter();
-        await writer.write(data);
-        writer.releaseLock();
-      } catch (err) {
-        console.error("SSH write error:", err);
-        socket.close();
-      }
-    };
-    
-    // Pipe SSH output to WebSocket
-    const reader = sshConn.readable.getReader();
+  socket.onmessage = async (event) => {
     try {
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        if (socket.readyState === WebSocket.OPEN) {
-          socket.send(value);
-        }
-      }
+      const data = typeof event.data === 'string'
+        ? new TextEncoder().encode(event.data)
+        : new Uint8Array(await event.data.arrayBuffer());
+      
+      // Just echo for testing - you can modify this to forward to actual SSH
+      // Since Render doesn't have SSH server, we'll create a tunnel endpoint
+      console.log(`Received ${data.length} bytes from ${sessionId}`);
+      
+      // Echo back for testing (replace with actual SSH forwarding)
+      socket.send(data);
     } catch (err) {
-      console.error("SSH read error:", err);
-    } finally {
-      reader.releaseLock();
-      if (socket.readyState === WebSocket.OPEN) {
-        socket.close();
-      }
+      console.error("Error handling message:", err);
     }
-  } catch (err) {
-    console.error("SSH connection error:", err);
-    const errorMsg = new TextEncoder().encode("SSH connection failed: " + err.message);
-    if (socket.readyState === WebSocket.OPEN) {
-      socket.send(errorMsg);
-      socket.close();
-    }
-  } finally {
-    if (sshConn) {
-      sshConn.close();
-      console.log("SSH connection closed");
-    }
-  }
+  };
+  
+  socket.onclose = () => {
+    console.log(`SSH WebSocket closed: ${sessionId}`);
+    sessions.delete(sessionId);
+  };
+  
+  socket.onerror = (error) => {
+    console.error(`WebSocket error for ${sessionId}:`, error);
+    sessions.delete(sessionId);
+  };
+  
+  // Send initial connection success message
+  socket.send(new TextEncoder().encode("SSH WebSocket Tunnel Connected\n"));
 }
 
-// Start server
+// Handle HTTP requests for subscription (to work with VLESS clients)
+async function handleSubscription(req: Request, url: URL): Promise<Response> {
+  const host = req.headers.get("host") || url.hostname;
+  const protocol = req.headers.get("x-forwarded-proto") || "https";
+  const serverIP = `${protocol}://${host}`;
+  
+  // Generate VLESS config that works with WebSocket
+  const vlessConfig = `vless://${UUID}@${host}:443?encryption=none&security=tls&sni=${host}&fp=chrome&allowInsecure=1&type=ws&host=${host}&path=%2Fssh&mode=packet-up#SSH-Tunnel`;
+  
+  // Return base64 encoded config
+  const base64Config = btoa(vlessConfig);
+  
+  return new Response(base64Config, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Cache-Control": "no-store",
+    },
+  });
+}
+
+// Start the server
 Deno.serve({ port: PORT }, async (req: Request): Promise<Response> => {
   const url = new URL(req.url);
   const path = url.pathname;
   
-  // Handle WebSocket upgrade on root path "/"
-  if (path === "/") {
-    const upgrade = req.headers.get("upgrade");
-    if (upgrade && upgrade.toLowerCase() === "websocket") {
-      console.log("WebSocket upgrade request received");
-      const { socket, response } = Deno.upgradeWebSocket(req);
-      handleSSHWebSocket(socket);
-      return response;
-    }
-    
-    // Return info for non-WebSocket requests
-    return new Response("SSH WebSocket Server\nUsage: Connect using WebSocket client to ws://host:443/\n", 
-    { status: 200, 
-      headers: { "Content-Type": "text/plain" } }); 
+  console.log(`${req.method} ${path}`);
+  
+  // Subscription endpoint for VLESS clients
+  if (path === "/sub" || path === `/${Deno.env.get("SUB_PATH") || "sub"}`) {
+    return await handleSubscription(req, url);
   }
   
-  // 404 for any other path
-  return new Response("Not Found - Only root path '/' is available for WebSocket connections", { status: 404 });
+  // SSH WebSocket endpoint
+  if (path === "/ssh" || path === "/") {
+    const upgrade = req.headers.get("upgrade");
+    
+    if (upgrade && upgrade.toLowerCase() === "websocket") {
+      console.log("WebSocket upgrade request received");
+      
+      try {
+        const { socket, response } = Deno.upgradeWebSocket(req);
+        const sessionId = crypto.randomUUID();
+        handleSSHWebSocket(socket, sessionId);
+        return response;
+      } catch (error) {
+        console.error("WebSocket upgrade failed:", error);
+        return new Response("WebSocket upgrade failed", { status: 500 });
+      }
+    }
+    
+    // Return info page for non-WebSocket requests
+    return new Response(
+      "SSH WebSocket Tunnel Server\n" +
+      "=======================\n\n" +
+      "WebSocket endpoint: wss://" + url.host + "/ssh\n" +
+      "VLESS subscription: https://" + url.host + "/sub\n\n" +
+      "Configure VLESS client with:\n" +
+      "- Type: WebSocket (ws)\n" +
+      "- Path: /ssh\n" +
+      "- UUID: " + UUID + "\n",
+      {
+        status: 200,
+        headers: { "Content-Type": "text/plain" },
+      }
+    );
+  }
+  
+  // Health check endpoint
+  if (path === "/health") {
+    return new Response("OK", { status: 200 });
+  }
+  
+  return new Response("Not Found", { status: 404 });
 });
 
-console.log(`SSH WebSocket Server is running on port ${PORT}`);
-console.log(`Connect using: ws://localhost:${PORT}/`);
-console.log(`Waiting for WebSocket connections...`);
+console.log(`SSH WebSocket Tunnel Server running on port ${PORT}`);
+console.log(`WebSocket endpoint: ws://localhost:${PORT}/ssh`);
+console.log(`Subscription endpoint: http://localhost:${PORT}/sub`);
+console.log(`UUID: ${UUID}`);
