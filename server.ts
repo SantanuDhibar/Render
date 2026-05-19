@@ -3,8 +3,8 @@
 
 const UUID: string = Deno.env.get("UUID") || "f9a1ba12-7187-4b25-a5d5-7bafd82ffb4d";
 const SUB_PATH: string = Deno.env.get("SUB_PATH") || "sub";  // Get subscription path
-const WS_PATH: string = Deno.env.get("WS_PATH") || "vless";   // VLESS WebSocket path
-const SSH_WS_PATH: string = Deno.env.get("SSH_WS_PATH") || "ssh"; // SSH WebSocket path
+const XPATH: string = Deno.env.get("XPATH") || "xhttp";      // Node path
+const WSPATH: string = Deno.env.get("WSPATH") || "ws";       // WebSocket path
 const DOMAIN: string = Deno.env.get("DOMAIN") || "render-pdj5.onrender.com";         // Your Render domain (required)
 const NAME: string = Deno.env.get("NAME") || "Render";
 const PORT: number = parseInt(Deno.env.get("PORT") || "8080"); // Render uses 8080 by default
@@ -13,8 +13,8 @@ interface Settings {
   UUID: string;
   LOG_LEVEL: "none" | "debug" | "info" | "warn" | "error";
   BUFFER_SIZE: number;
-  WS_PATH: string;
-  SSH_WS_PATH: string;
+  XPATH: string;
+  WSPATH: string;
   MAX_BUFFERED_POSTS: number;
   MAX_POST_SIZE: number;
   SESSION_TIMEOUT: number;
@@ -27,8 +27,8 @@ const SETTINGS: Settings = {
   UUID,
   LOG_LEVEL: "none",
   BUFFER_SIZE: 2048,
-  WS_PATH: `/${WS_PATH}`,
-  SSH_WS_PATH: `/${SSH_WS_PATH}`,
+  XPATH: `%2F${XPATH}`,
+  WSPATH: `%2F${WSPATH}`,
   MAX_BUFFERED_POSTS: 30,
   MAX_POST_SIZE: 1000000,
   SESSION_TIMEOUT: 30000,
@@ -235,185 +235,280 @@ function relay(
   downloader.finally(() => uploader).finally(cleanup);
 }
 
-// WebSocket handler for VLESS
-async function handleVLESSWebSocket(ws: WebSocket, uuid: string) {
-  let remote: Deno.Conn | null = null;
-  let vlessHeader: any = null;
-  let initialized = false;
-  
-  try {
-    // Wait for first message which contains VLESS header
-    const firstMessage = await new Promise<Uint8Array>((resolve, reject) => {
-      ws.onmessage = (event) => {
-        if (event.data instanceof ArrayBuffer) {
-          resolve(new Uint8Array(event.data));
-        } else {
-          reject(new Error("Invalid message format"));
-        }
+const sessions = new Map<string, Session>();
+
+class Session {
+  uuid: string;
+  nextSeq: number = 0;
+  downstreamStarted: boolean = false;
+  lastActivity: number = Date.now();
+  vlessHeader: any = null;
+  remote: Deno.Conn | null = null;
+  initialized: boolean = false;
+  responseHeader: Uint8Array | null = null;
+  headerSent: boolean = false;
+  bufferedData: Map<number, Uint8Array> = new Map();
+  cleaned: boolean = false;
+  pendingPackets: Uint8Array[] = [];
+  currentStreamRes: { writable: WritableStream<Uint8Array> } | null = null;
+  pendingBuffers: Map<number, Uint8Array> = new Map();
+
+  constructor(uuid: string) {
+    this.uuid = uuid;
+  }
+
+  async initializeVLESS(firstPacket: Uint8Array): Promise<boolean> {
+    if (this.initialized) return true;
+
+    try {
+      const readable = new ReadableStream({
+        start(controller) {
+          controller.enqueue(firstPacket);
+          controller.close();
+        },
+      });
+
+      const client = {
+        readable,
+        writable: new WritableStream(),
       };
-      ws.onerror = (err) => reject(err);
-      setTimeout(() => reject(new Error("Timeout waiting for VLESS header")), 10000);
-    });
 
-    // Parse VLESS header
-    const readable = new ReadableStream({
-      start(controller) {
-        controller.enqueue(firstMessage);
-        controller.close();
-      },
-    });
-
-    const client = {
-      readable,
-      writable: new WritableStream(),
-    };
-
-    vlessHeader = await parse_header(SETTINGS.UUID, client);
-    remote = await connect_remote(vlessHeader.hostname, vlessHeader.port);
-    initialized = true;
-
-    // Send response header
-    ws.send(vlessHeader.resp.buffer);
-
-    // Send remaining data
-    if (vlessHeader.data.length > 0) {
-      ws.send(vlessHeader.data.buffer);
+      this.vlessHeader = await parse_header(SETTINGS.UUID, client);
+      this.remote = await connect_remote(this.vlessHeader.hostname, this.vlessHeader.port);
+      this.initialized = true;
+      return true;
+    } catch (err) {
+      return false;
     }
+  }
 
-    // Handle bidirectional data transfer
-    ws.onmessage = async (event) => {
-      if (!remote || !initialized) return;
-      
-      if (event.data instanceof ArrayBuffer) {
-        const data = new Uint8Array(event.data);
-        const writer = remote.writable.getWriter();
-        await writer.write(data);
-        writer.releaseLock();
-      }
-    };
+  async processPacket(seq: number, data: Uint8Array): Promise<boolean> {
+    try {
+      this.pendingBuffers.set(seq, data);
 
-    // Read from remote and send to WebSocket
-    (async () => {
-      const reader = remote!.readable.getReader();
-      try {
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          if (value && value.length > 0) {
-            ws.send(value.buffer);
+      while (this.pendingBuffers.has(this.nextSeq)) {
+        const nextData = this.pendingBuffers.get(this.nextSeq)!;
+        this.pendingBuffers.delete(this.nextSeq);
+
+        if (!this.initialized && this.nextSeq === 0) {
+          if (!await this.initializeVLESS(nextData)) {
+            throw new Error("Failed to initialize VLESS connection");
           }
+          this.responseHeader = this.vlessHeader.resp;
+          await this._writeToRemote(this.vlessHeader.data);
+
+          if (this.currentStreamRes) {
+            this._startDownstreamResponse();
+          }
+        } else {
+          if (!this.initialized) {
+            continue;
+          }
+          await this._writeToRemote(nextData);
         }
-      } catch (err) {
-        // Connection closed
-      } finally {
-        reader.releaseLock();
-        ws.close();
-      }
-    })();
 
-    ws.onclose = () => {
-      if (remote) {
-        try {
-          remote.close();
-        } catch (err) {}
-        remote = null;
+        this.nextSeq++;
       }
-    };
 
-    ws.onerror = () => {
-      if (remote) {
-        try {
-          remote.close();
-        } catch (err) {}
-        remote = null;
+      if (this.pendingBuffers.size > SETTINGS.MAX_BUFFERED_POSTS) {
+        throw new Error("Too many buffered packets");
       }
-    };
 
-  } catch (err) {
-    if (remote) {
-      try {
-        remote.close();
-      } catch (err) {}
+      return true;
+    } catch (err) {
+      throw err;
     }
-    ws.close();
+  }
+
+  startDownstream(res: { writable: WritableStream<Uint8Array> }): boolean {
+    this.currentStreamRes = res;
+    if (this.initialized && this.responseHeader) {
+      this._startDownstreamResponse();
+    }
+    return true;
+  }
+
+  async _writeToRemote(data: Uint8Array): Promise<void> {
+    if (!this.remote) {
+      throw new Error("Remote connection not available");
+    }
+    const writer = this.remote.writable.getWriter();
+    await writer.write(data);
+    writer.releaseLock();
+  }
+
+  _startDownstreamResponse(): void {
+    if (!this.currentStreamRes || !this.responseHeader) return;
+
+    try {
+      const writer = this.currentStreamRes.writable.getWriter();
+      writer.write(this.responseHeader);
+      this.headerSent = true;
+      writer.releaseLock();
+
+      this.remote!.readable.pipeTo(this.currentStreamRes.writable).catch((err) => {
+      });
+    } catch (err) {
+      this.cleanup();
+    }
+  }
+
+  cleanup(): void {
+    if (!this.cleaned) {
+      this.cleaned = true;
+      if (this.remote) {
+        this.remote.close();
+        this.remote = null;
+      }
+      this.initialized = false;
+      this.headerSent = false;
+    }
   }
 }
 
-// WebSocket handler for SSH
-async function handleSSHWebSocket(ws: WebSocket, host?: string, port?: string) {
-  let remote: Deno.Conn | null = null;
+// WebSocket handler for VLESS
+async function handleVLESSWebSocket(socket: WebSocket, uuid: string) {
+  const session = new Session(uuid);
+  sessions.set(uuid, session);
+  
+  let initialized = false;
+  let remoteConn: Deno.Conn | null = null;
+  let vlessHeader: any = null;
+
+  socket.onmessage = async (event) => {
+    try {
+      const data = typeof event.data === 'string' 
+        ? new TextEncoder().encode(event.data)
+        : new Uint8Array(await event.data.arrayBuffer());
+
+      if (!initialized) {
+        // Parse VLESS header from first message
+        const readable = new ReadableStream({
+          start(controller) {
+            controller.enqueue(data);
+            controller.close();
+          },
+        });
+
+        const client = { readable, writable: new WritableStream() };
+        vlessHeader = await parse_header(SETTINGS.UUID, client);
+        remoteConn = await connect_remote(vlessHeader.hostname, vlessHeader.port);
+        
+        // Send VLESS response
+        socket.send(vlessHeader.resp);
+        
+        // Send remaining data
+        if (vlessHeader.data.length > 0) {
+          const writer = remoteConn.writable.getWriter();
+          await writer.write(vlessHeader.data);
+          writer.releaseLock();
+        }
+        
+        initialized = true;
+
+        // Start piping from remote to WebSocket
+        const pumpRemoteToWS = async () => {
+          const reader = remoteConn!.readable.getReader();
+          try {
+            while (true) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              if (socket.readyState === WebSocket.OPEN) {
+                socket.send(value);
+              }
+            }
+          } catch (err) {
+            console.error("Remote to WS error:", err);
+          } finally {
+            reader.releaseLock();
+            if (socket.readyState === WebSocket.OPEN) {
+              socket.close();
+            }
+          }
+        };
+        
+        pumpRemoteToWS();
+      } else if (remoteConn) {
+        // Send data to remote
+        const writer = remoteConn.writable.getWriter();
+        await writer.write(data);
+        writer.releaseLock();
+      }
+    } catch (err) {
+      console.error("WebSocket error:", err);
+      socket.close();
+    }
+  };
+
+  socket.onclose = () => {
+    if (remoteConn) {
+      remoteConn.close();
+    }
+    session.cleanup();
+    sessions.delete(uuid);
+  };
+
+  socket.onerror = (error) => {
+    console.error("WebSocket error:", error);
+    if (remoteConn) {
+      remoteConn.close();
+    }
+    session.cleanup();
+    sessions.delete(uuid);
+  };
+}
+
+// SSH WebSocket handler
+async function handleSSHWebSocket(socket: WebSocket) {
+  let sshConn: Deno.Conn | null = null;
   
   try {
-    // Default SSH connection parameters
-    const sshHost = host || "localhost";
-    const sshPort = port ? parseInt(port) : 22;
+    // Connect to local SSH server (port 22)
+    sshConn = await Deno.connect({ hostname: "127.0.0.1", port: 22 });
     
-    // Connect to SSH server
-    remote = await Deno.connect({ hostname: sshHost, port: sshPort });
-    
-    // Handle bidirectional data transfer
-    ws.onmessage = async (event) => {
-      if (!remote) return;
+    socket.onmessage = async (event) => {
+      if (!sshConn) return;
       
-      if (event.data instanceof ArrayBuffer) {
-        const data = new Uint8Array(event.data);
-        const writer = remote.writable.getWriter();
-        await writer.write(data);
-        writer.releaseLock();
-      } else if (typeof event.data === 'string') {
-        // Handle text data if needed
-        const encoder = new TextEncoder();
-        const data = encoder.encode(event.data);
-        const writer = remote.writable.getWriter();
-        await writer.write(data);
-        writer.releaseLock();
-      }
-    };
-
-    // Read from remote and send to WebSocket
-    (async () => {
-      const reader = remote!.readable.getReader();
       try {
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          if (value && value.length > 0) {
-            ws.send(value.buffer);
-          }
-        }
+        const data = typeof event.data === 'string'
+          ? new TextEncoder().encode(event.data)
+          : new Uint8Array(await event.data.arrayBuffer());
+        
+        const writer = sshConn.writable.getWriter();
+        await writer.write(data);
+        writer.releaseLock();
       } catch (err) {
-        // Connection closed
-      } finally {
-        reader.releaseLock();
-        ws.close();
-      }
-    })();
-
-    ws.onclose = () => {
-      if (remote) {
-        try {
-          remote.close();
-        } catch (err) {}
-        remote = null;
+        console.error("SSH write error:", err);
+        socket.close();
       }
     };
-
-    ws.onerror = () => {
-      if (remote) {
-        try {
-          remote.close();
-        } catch (err) {}
-        remote = null;
+    
+    // Pipe SSH output to WebSocket
+    const reader = sshConn.readable.getReader();
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(value);
+        }
       }
-    };
-
-  } catch (err) {
-    if (remote) {
-      try {
-        remote.close();
-      } catch (err) {}
+    } catch (err) {
+      console.error("SSH read error:", err);
+    } finally {
+      reader.releaseLock();
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.close();
+      }
     }
-    ws.close();
+  } catch (err) {
+    console.error("SSH connection error:", err);
+    socket.send(new TextEncoder().encode("SSH connection failed: " + err.message));
+    socket.close();
+  } finally {
+    if (sshConn) {
+      sshConn.close();
+    }
   }
 }
 
@@ -443,7 +538,7 @@ function generatePadding(min: number, max: number): string {
   return btoa(Array(length).fill("X").join(""));
 }
 
-// Use Deno.serve with WebSocket upgrade support
+// Use Deno.serve instead of serve from std library for better compatibility
 Deno.serve({ port: PORT }, async (req: Request): Promise<Response> => {
   const url = new URL(req.url);
   const path = url.pathname;
@@ -456,64 +551,104 @@ Deno.serve({ port: PORT }, async (req: Request): Promise<Response> => {
     "X-Padding": generatePadding(100, 1000),
   };
 
-  if (path === "/") { 
-    return new Response("VLESS + SSH WebSocket Server Running on Render\n", 
+  // SSH WebSocket on root path "/"
+  if (path === "/") {
+    if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
+      const { socket, response } = Deno.upgradeWebSocket(req);
+      handleSSHWebSocket(socket);
+      return response;
+    }
+    return new Response("SSH WebSocket Server Running on Render\n", 
     { status: 200, 
       headers: { "Content-Type": "text/plain" }, }); 
-  } 
+  }
 
+  // VLESS WebSocket on /ws path
+  if (path === `/${WSPATH}`) {
+    if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
+      const urlParams = new URLSearchParams(url.search);
+      const uuid = urlParams.get("uuid") || UUID;
+      const { socket, response } = Deno.upgradeWebSocket(req);
+      handleVLESSWebSocket(socket, uuid);
+      return response;
+    }
+    return new Response("WebSocket endpoint for VLESS", { status: 400 });
+  }
+
+  // VLESS subscription endpoint
   if (path === `/${SUB_PATH}`) {
     const serverIP = IP || url.hostname;
-    // Generate VLESS WebSocket URL
-    const vlessURL = `vless://${UUID}@${serverIP}:443?encryption=none&security=tls&sni=${serverIP}&fp=chrome&allowInsecure=1&type=ws&host=${serverIP}&path=${SETTINGS.WS_PATH}/${UUID}#${NAME}-${ISP}`;
-    const base64Content = btoa(vlessURL);
+    const vlessWSUrl = `vless://${UUID}@${serverIP}:443?encryption=none&security=tls&sni=${serverIP}&fp=chrome&allowInsecure=1&type=ws&host=${serverIP}&path=${SETTINGS.WSPATH}&mode=packet-up#${NAME}-${ISP}`;
+    const vlessXHTTPUrl = `vless://${UUID}@${serverIP}:443?encryption=none&security=tls&sni=${serverIP}&fp=chrome&allowInsecure=1&type=xhttp&host=${serverIP}&path=${SETTINGS.XPATH}&mode=packet-up#${NAME}-${ISP}-xhttp`;
+    const base64Content = btoa(`${vlessWSUrl}\n${vlessXHTTPUrl}`);
     return new Response(base64Content + "\n", {
       status: 200,
       headers: { "Content-Type": "text/plain" },
     });
   }
 
-  // Handle VLESS WebSocket connections
-  if (path.startsWith(SETTINGS.WS_PATH)) {
-    const uuidMatch = path.match(new RegExp(`^${SETTINGS.WS_PATH}/([^/]+)$`));
-    if (!uuidMatch) {
-      return new Response("Not Found", { status: 404 });
-    }
-    
-    const clientUUID = uuidMatch[1];
-    if (clientUUID !== UUID) {
-      return new Response("Unauthorized", { status: 401 });
-    }
-    
-    // Upgrade to WebSocket
-    const { socket, response } = Deno.upgradeWebSocket(req);
-    handleVLESSWebSocket(socket, clientUUID);
-    return response;
-  }
+  // XHTTP endpoint (existing)
+  const pathMatch = path.match(new RegExp(`/${XPATH}/([^/]+)(?:/([0-9]+))?$`));
+  if (pathMatch) {
+    const uuid = pathMatch[1];
+    const seq = pathMatch[2] ? parseInt(pathMatch[2]) : null;
 
-  // Handle SSH WebSocket connections
-  if (path.startsWith(SETTINGS.SSH_WS_PATH)) {
-    const sshMatch = path.match(new RegExp(`^${SETTINGS.SSH_WS_PATH}(?:/([^/]+)(?:/([0-9]+))?)?$`));
-    
-    // Upgrade to WebSocket
-    const { socket, response } = Deno.upgradeWebSocket(req);
-    
-    if (sshMatch && sshMatch[1]) {
-      // Connect to specified SSH host
-      const sshHost = sshMatch[1];
-      const sshPort = sshMatch[2] || "22";
-      handleSSHWebSocket(socket, sshHost, sshPort);
-    } else {
-      // Connect to default local SSH
-      handleSSHWebSocket(socket);
+    if (req.method === "GET" && !seq) {
+      let session = sessions.get(uuid);
+      if (!session) {
+        session = new Session(uuid);
+        sessions.set(uuid, session);
+      }
+
+      session.downstreamStarted = true;
+      const { readable, writable } = new TransformStream();
+      session.startDownstream({ writable });
+
+      return new Response(readable, {
+        status: 200,
+        headers: {
+          ...headers,
+          "Content-Type": "application/octet-stream",
+          "Transfer-Encoding": "chunked",
+        },
+      });
     }
-    return response;
+
+    if (req.method === "POST" && seq !== null) {
+      let session = sessions.get(uuid);
+      if (!session) {
+        session = new Session(uuid);
+        sessions.set(uuid, session);
+
+        setTimeout(() => {
+          const currentSession = sessions.get(uuid);
+          if (currentSession && !currentSession.downstreamStarted) {
+            currentSession.cleanup();
+            sessions.delete(uuid);
+          }
+        }, SETTINGS.SESSION_TIMEOUT);
+      }
+
+      const data = await req.arrayBuffer();
+      const buffer = new Uint8Array(data);
+
+      try {
+        await session.processPacket(seq, buffer);
+        return new Response(null, { status: 200, headers });
+      } catch (err) {
+        session.cleanup();
+        sessions.delete(uuid);
+        return new Response(null, { status: 500 });
+      }
+    }
+    return new Response("Not Found", { status: 404 });
   }
 
   return new Response("Not Found", { status: 404 });
 });
 
 console.log(`Server is running on port ${PORT}`);
-console.log(`VLESS WebSocket endpoint: ${SETTINGS.WS_PATH}/{uuid}`);
-console.log(`SSH WebSocket endpoint: ${SETTINGS.SSH_WS_PATH}/{host}/{port}`);
-console.log(`Subscription endpoint: /${SUB_PATH}`);
+console.log(`- SSH WebSocket endpoint: ws://localhost:${PORT}/`);
+console.log(`- VLESS WebSocket endpoint: ws://localhost:${PORT}/${WSPATH}`);
+console.log(`- VLESS XHTTP endpoint: http://localhost:${PORT}/${XPATH}/<uuid>/`);
+console.log(`- Subscription endpoint: http://localhost:${PORT}/${SUB_PATH}`);
