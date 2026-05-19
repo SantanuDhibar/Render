@@ -5,7 +5,7 @@ const UUID: string = Deno.env.get("UUID") || "f9a1ba12-7187-4b25-a5d5-7bafd82ffb
 const SUB_PATH: string = Deno.env.get("SUB_PATH") || "sub";  // Get subscription path
 const XPATH: string = Deno.env.get("XPATH") || "xhttp";      // Node path
 const WSPATH: string = Deno.env.get("WSPATH") || "ws";       // WebSocket path
-const DOMAIN: string = Deno.env.get("DOMAIN") || "render-pdj5.onrender.com";         // Your Render domain (required)
+const DOMAIN: string = Deno.env.get("DOMAIN") || "render.santanudhibar.deno.net";         // Your Render domain (required)
 const NAME: string = Deno.env.get("NAME") || "Render";
 const PORT: number = parseInt(Deno.env.get("PORT") || "8080"); // Render uses 8080 by default
 
