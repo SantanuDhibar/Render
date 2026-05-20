@@ -1,41 +1,23 @@
 // server.ts
-// SSH over WebSocket (stable, Render-friendly)
+// SSH over WebSocket TLS (root path), with /sub returning raw payload
 
 const SUB_PATH: string = Deno.env.get("SUB_PATH") || "sub";
-const DOMAIN: string = Deno.env.get("DOMAIN") || "render.santanudhibar.deno.net";
-const NAME: string = Deno.env.get("NAME") || "Render";
 const PORT: number = parseInt(Deno.env.get("PORT") || "8080");
 
-const WS_PATH = "/ws";
-
-// Fixed credentials
+// Fixed auth
 const AUTH_USER = "sd";
 const AUTH_PASS = "12345@1";
 
 // Random WS key (as requested)
 const WS_KEY = "KQ9zN7pVwX3mL2sA";
 
-// SSH target
+// SSH target (TLS)
 const SSH_HOST = "render.santanudhibar.deno.net";
 const SSH_PORT = 443;
+const SSH_SNI = "render.santanudhibar.deno.net";
 
 // Optional idle timeout
 const IDLE_TIMEOUT_MS: number = parseInt(Deno.env.get("IDLE_TIMEOUT_MS") || "0");
-
-let ISP = "";
-try {
-  const response = await fetch("https://speed.cloudflare.com/meta");
-  if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-  const data = (await response.json()) as { country: string; asOrganization: string };
-  ISP = `${data.country}-${data.asOrganization}`.replace(/ /g, "_");
-} catch (_err) {
-  ISP = "unknown";
-}
-
-let IP = DOMAIN;
-if (!DOMAIN) {
-  IP = Deno.env.get("RENDER_EXTERNAL_HOSTNAME") || "localhost";
-}
 
 function generatePadding(min: number, max: number): string {
   const length = min + Math.floor(Math.random() * (max - min));
@@ -106,8 +88,12 @@ async function relay_ssh_ws(ws: WebSocket, reqUrl: URL): Promise<void> {
     }, IDLE_TIMEOUT_MS) as unknown as number;
   };
 
-  // Raw SSH over TCP (no TLS/SNI)
-  const remote = await Deno.connect({ hostname: SSH_HOST, port: SSH_PORT });
+  // SSH over TLS
+  const remote = await Deno.connectTls({
+    hostname: SSH_HOST,
+    port: SSH_PORT,
+    serverName: SSH_SNI,
+  });
 
   const aborter = new AbortController();
   const abort = () => {
@@ -152,25 +138,24 @@ Deno.serve({ port: PORT }, async (req: Request): Promise<Response> => {
     "X-Padding": generatePadding(100, 1000),
   };
 
-  if (path === "/") {
-    return new Response("SSH WS Server Running\n", {
-      status: 200,
-      headers: { "Content-Type": "text/plain" },
-    });
-  }
-
+  // /sub returns raw payload (not clipboard config)
   if (path === `/${SUB_PATH}`) {
-    const serverIP = IP || url.hostname;
-    const wsURL =
-      `wss://${serverIP}${WS_PATH}?key=${WS_KEY}&user=${AUTH_USER}&pass=${AUTH_PASS}`;
-    const base64Content = btoa(wsURL);
-    return new Response(base64Content + "\n", {
+    const payload =
+`GET / HTTP/1.1[crlf]
+Host:${SSH_HOST}[crlf]
+Connection: Upgrade[crlf]
+User-Agent: [ua][crlf]
+Upgrade: websocket[crlf][crlf]
+key=${WS_KEY}&user=${AUTH_USER}&pass=${AUTH_PASS}
+`;
+    return new Response(payload, {
       status: 200,
       headers: { "Content-Type": "text/plain" },
     });
   }
 
-  if (path === WS_PATH) {
+  // Root path = WebSocket
+  if (path === "/") {
     const upgrade = req.headers.get("upgrade") || "";
     if (upgrade.toLowerCase() !== "websocket") {
       return new Response("WebSocket Upgrade Required", { status: 426 });
