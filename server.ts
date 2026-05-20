@@ -1,25 +1,15 @@
 // server.ts
-// Stable Render deployment (WebSocket version) + SSH over WS
+// Stable Render deployment (WebSocket version) with SSH Proxy
 
 const UUID: string = Deno.env.get("UUID") || "f9a1ba12-7187-4b25-a5d5-7bafd82ffb4d";
 const SUB_PATH: string = Deno.env.get("SUB_PATH") || "sub";
 const DOMAIN: string = Deno.env.get("DOMAIN") || "render.santanudhibar.deno.net";
 const NAME: string = Deno.env.get("NAME") || "Render";
-const PORT: number = parseInt(Deno.env.get("PORT") || "8080");
+// Updated default port to 443
+const PORT: number = parseInt(Deno.env.get("PORT") || "443");
 
 // WS path that clients connect to
 const WS_PATH: string = "/ws";
-
-// SSH over WS path
-const SSH_WS_PATH: string = "/ssh";
-
-// Hardcoded random SSH WS auth
-const SSH_USER = "user_8f3d1c";
-const SSH_PASS = "pass_b7a2e9";
-
-// SSH target
-const SSH_HOST = Deno.env.get("SSH_HOST") || "127.0.0.1";
-const SSH_PORT = parseInt(Deno.env.get("SSH_PORT") || "443");
 
 // Optional timeouts (ms). Set to 0 to disable.
 const HEADER_TIMEOUT_MS: number = parseInt(Deno.env.get("HEADER_TIMEOUT_MS") || "10000");
@@ -350,25 +340,6 @@ async function relay_ws(ws: WebSocket): Promise<void> {
   }
 }
 
-// Auth: if provided (query or basic), validate; if not provided, allow
-function validateSshAuth(url: URL, req: Request): boolean {
-  const qUser = url.searchParams.get("user");
-  const qPass = url.searchParams.get("pass");
-  if (qUser || qPass) {
-    return qUser === SSH_USER && qPass === SSH_PASS;
-  }
-
-  const auth = req.headers.get("authorization") || "";
-  if (auth.startsWith("Basic ")) {
-    const decoded = atob(auth.slice(6));
-    const [u, p] = decoded.split(":");
-    return u === SSH_USER && p === SSH_PASS;
-  }
-
-  // No auth provided -> allow
-  return true;
-}
-
 Deno.serve({ port: PORT }, async (req: Request): Promise<Response> => {
   const url = new URL(req.url);
   const path = url.pathname;
@@ -382,7 +353,7 @@ Deno.serve({ port: PORT }, async (req: Request): Promise<Response> => {
   };
 
   if (path === "/") {
-    return new Response("VLESS WS Server Running on Render\n", {
+    return new Response("VLESS + SSH WS Server Running on Render\n", {
       status: 200,
       headers: { "Content-Type": "text/plain" },
     });
@@ -399,6 +370,59 @@ Deno.serve({ port: PORT }, async (req: Request): Promise<Response> => {
       headers: { "Content-Type": "text/plain" },
     });
   }
+
+  // ==== SSH Over WebSocket Handling ====
+  if (path === "/ssh") {
+    // Check Basic Auth for admin:12345 (YWRtaW46MTIzNDU=)
+    const authHeader = req.headers.get("Authorization") || "";
+    if (authHeader !== "Basic YWRtaW46MTIzNDU=") {
+      return new Response("Unauthorized", {
+        status: 401,
+        headers: {
+          "WWW-Authenticate": 'Basic realm="SSH Access"',
+          ...headers,
+        },
+      });
+    }
+
+    const upgrade = req.headers.get("upgrade") || "";
+    if (upgrade.toLowerCase() !== "websocket") {
+      return new Response("WebSocket Upgrade Required", { status: 426, headers });
+    }
+
+    const { socket, response } = Deno.upgradeWebSocket(req);
+
+    socket.onopen = async () => {
+      try {
+        socket.binaryType = "arraybuffer";
+        // Connect to local SSH daemon
+        const remote = await Deno.connect({ hostname: "127.0.0.1", port: 22 });
+        const wsStream = wsReadableStream(socket);
+        const aborter = new AbortController();
+
+        const abort = () => {
+          try { aborter.abort(); } catch {}
+          try { remote.close(); } catch {}
+        };
+
+        socket.addEventListener("close", abort);
+        socket.addEventListener("error", abort);
+
+        // Pipe bidirectional traffic
+        const wsToRemote = wsStream.pipeTo(remote.writable, { signal: aborter.signal, preventClose: false });
+        const remoteToWs = remote.readable.pipeTo(wsWritableStream(socket), { signal: aborter.signal, preventClose: false });
+
+        await Promise.race([wsToRemote, remoteToWs]);
+      } catch (err) {
+        console.error("SSH proxy error:", err);
+      } finally {
+        try { socket.close(); } catch {}
+      }
+    };
+
+    return response;
+  }
+  // =====================================
 
   if (path === WS_PATH) {
     const upgrade = req.headers.get("upgrade") || "";
@@ -417,41 +441,7 @@ Deno.serve({ port: PORT }, async (req: Request): Promise<Response> => {
     return response;
   }
 
-  if (path === SSH_WS_PATH) {
-    const upgrade = req.headers.get("upgrade") || "";
-    if (upgrade.toLowerCase() !== "websocket") {
-      return new Response("WebSocket Upgrade Required", { status: 426 });
-    }
-
-    if (!validateSshAuth(url, req)) {
-      return new Response("Unauthorized", { status: 401 });
-    }
-
-    const { socket, response } = Deno.upgradeWebSocket(req);
-    socket.binaryType = "arraybuffer";
-
-    (async () => {
-      try {
-        const sshConn = await Deno.connect({ hostname: SSH_HOST, port: SSH_PORT });
-
-        // ws -> ssh
-        const wsToSsh = wsReadableStream(socket).pipeTo(sshConn.writable);
-
-        // ssh -> ws
-        const sshToWs = sshConn.readable.pipeTo(wsWritableStream(socket));
-
-        await Promise.race([wsToSsh, sshToWs]);
-      } catch (_err) {
-        try {
-          socket.close();
-        } catch (_e) {}
-      }
-    })();
-
-    return response;
-  }
-
-  return new Response("Not Found", { status: 404, headers });
+  return new Response("Not Found", { status: 404 });
 });
 
 console.log(`Server is running on port ${PORT}`);
