@@ -14,12 +14,12 @@ const WS_PATH: string = "/ws";
 const SSH_WS_PATH: string = "/ssh";
 
 // Hardcoded random SSH WS auth
-const SSH_USER = "user";
-const SSH_PASS = "pass";
+const SSH_USER = "user_8f3d1c";
+const SSH_PASS = "pass_b7a2e9";
 
 // SSH target
 const SSH_HOST = Deno.env.get("SSH_HOST") || "127.0.0.1";
-const SSH_PORT = parseInt(Deno.env.get("SSH_PORT") || "443");
+const SSH_PORT = parseInt(Deno.env.get("SSH_PORT") || "22");
 
 // Optional timeouts (ms). Set to 0 to disable.
 const HEADER_TIMEOUT_MS: number = parseInt(Deno.env.get("HEADER_TIMEOUT_MS") || "10000");
@@ -350,10 +350,23 @@ async function relay_ws(ws: WebSocket): Promise<void> {
   }
 }
 
-function validateSshAuth(url: URL): boolean {
-  const user = url.searchParams.get("user") || "";
-  const pass = url.searchParams.get("pass") || "";
-  return user === SSH_USER && pass === SSH_PASS;
+// Auth: if provided (query or basic), validate; if not provided, allow
+function validateSshAuth(url: URL, req: Request): boolean {
+  const qUser = url.searchParams.get("user");
+  const qPass = url.searchParams.get("pass");
+  if (qUser || qPass) {
+    return qUser === SSH_USER && qPass === SSH_PASS;
+  }
+
+  const auth = req.headers.get("authorization") || "";
+  if (auth.startsWith("Basic ")) {
+    const decoded = atob(auth.slice(6));
+    const [u, p] = decoded.split(":");
+    return u === SSH_USER && p === SSH_PASS;
+  }
+
+  // No auth provided -> allow
+  return true;
 }
 
 Deno.serve({ port: PORT }, async (req: Request): Promise<Response> => {
@@ -410,7 +423,7 @@ Deno.serve({ port: PORT }, async (req: Request): Promise<Response> => {
       return new Response("WebSocket Upgrade Required", { status: 426 });
     }
 
-    if (!validateSshAuth(url)) {
+    if (!validateSshAuth(url, req)) {
       return new Response("Unauthorized", { status: 401 });
     }
 
