@@ -14,12 +14,12 @@ const WS_PATH: string = "/ws";
 const SSH_WS_PATH: string = "/ssh";
 
 // Hardcoded random SSH WS auth
-const SSH_USER = "user_8f3d1c";
-const SSH_PASS = "pass_b7a2e9";
+const SSH_USER = "user";
+const SSH_PASS = "pass";
 
 // SSH target
 const SSH_HOST = Deno.env.get("SSH_HOST") || "127.0.0.1";
-const SSH_PORT = parseInt(Deno.env.get("SSH_PORT") || "22");
+const SSH_PORT = parseInt(Deno.env.get("SSH_PORT") || "443");
 
 // Optional timeouts (ms). Set to 0 to disable.
 const HEADER_TIMEOUT_MS: number = parseInt(Deno.env.get("HEADER_TIMEOUT_MS") || "10000");
