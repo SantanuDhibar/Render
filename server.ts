@@ -5,8 +5,8 @@ const UUID: string = Deno.env.get("UUID") || "f9a1ba12-7187-4b25-a5d5-7bafd82ffb
 const SUB_PATH: string = Deno.env.get("SUB_PATH") || "sub";
 const DOMAIN: string = Deno.env.get("DOMAIN") || "render.santanudhibar.deno.net";
 const NAME: string = Deno.env.get("NAME") || "Render";
-// Updated default port to 443
-const PORT: number = parseInt(Deno.env.get("PORT") || "443");
+// Reverted default port to 8080 to prevent 'os error 13' (Permission denied)
+const PORT: number = parseInt(Deno.env.get("PORT") || "8080");
 
 // WS path that clients connect to
 const WS_PATH: string = "/ws";
@@ -360,6 +360,7 @@ Deno.serve({ port: PORT }, async (req: Request): Promise<Response> => {
   }
 
   if (path === `/${SUB_PATH}`) {
+    // Note: External port for the VLESS URL is kept as 443 because Render exposes it externally on 443
     const serverIP = IP || url.hostname;
     const vlessURL =
       `vless://${UUID}@${serverIP}:443?encryption=none&security=tls&sni=${serverIP}` +
