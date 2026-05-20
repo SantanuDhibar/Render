@@ -1,12 +1,18 @@
 // server.ts
-// For Render deployment (WebSocket version)
+// Stable Render deployment (WebSocket version)
 
 const UUID: string = Deno.env.get("UUID") || "f9a1ba12-7187-4b25-a5d5-7bafd82ffb4d";
-const SUB_PATH: string = Deno.env.get("SUB_PATH") || "sub";  // Get subscription path
-const DOMAIN: string = Deno.env.get("DOMAIN") || "render.santanudhibar.deno.net"; // Your Render domain (required)
+const SUB_PATH: string = Deno.env.get("SUB_PATH") || "sub";
+const DOMAIN: string = Deno.env.get("DOMAIN") || "render-pdj5.onrender.com";
 const NAME: string = Deno.env.get("NAME") || "Render";
-const PORT: number = parseInt(Deno.env.get("PORT") || "8080"); // Render uses 8080 by default
+const PORT: number = parseInt(Deno.env.get("PORT") || "8080");
+
+// WS path that clients connect to
 const WS_PATH: string = "/ws";
+
+// Optional timeouts (ms). Set to 0 to disable.
+const HEADER_TIMEOUT_MS: number = parseInt(Deno.env.get("HEADER_TIMEOUT_MS") || "10000");
+const IDLE_TIMEOUT_MS: number = parseInt(Deno.env.get("IDLE_TIMEOUT_MS") || "0");
 
 interface Settings {
   UUID: string;
@@ -23,7 +29,7 @@ interface Settings {
 const SETTINGS: Settings = {
   UUID,
   LOG_LEVEL: "none",
-  BUFFER_SIZE: 2048,
+  BUFFER_SIZE: 64 * 1024,
   WS_PATH: "%2Fws",
   MAX_POST_SIZE: 1000000,
   SESSION_TIMEOUT: 30000,
@@ -89,6 +95,7 @@ async function read_vless_header(
   if (!validate_uuid(uuid, cfg_uuid)) {
     throw new Error("invalid UUID");
   }
+
   const pb_len = header[1 + 16];
   const addr_plus1 = 1 + 16 + 1 + pb_len + 1 + 2 + 1;
   await inner_read_until(addr_plus1 + 1);
@@ -106,6 +113,7 @@ async function read_vless_header(
   const ADDRESS_TYPE_STRING = 2;
   const ADDRESS_TYPE_IPV6 = 3;
   let header_len = -1;
+
   if (atype === ADDRESS_TYPE_IPV4) {
     header_len = addr_plus1 + 4;
   } else if (atype === ADDRESS_TYPE_IPV6) {
@@ -113,9 +121,11 @@ async function read_vless_header(
   } else if (atype === ADDRESS_TYPE_STRING) {
     header_len = addr_plus1 + 1 + header[addr_plus1];
   }
+
   if (header_len < 0) {
     throw new Error("read address type failed");
   }
+
   await inner_read_until(header_len);
 
   const idx = addr_plus1;
@@ -144,13 +154,30 @@ async function read_vless_header(
   };
 }
 
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  if (ms <= 0) return promise;
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timeout`)), ms);
+    promise.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      }
+    );
+  });
+}
+
 async function parse_header(
   uuid_str: string,
   client: { readable: ReadableStream<Uint8Array> }
 ): Promise<any> {
   const reader = client.readable.getReader();
   try {
-    const vless = await read_vless_header(reader, uuid_str);
+    const vless = await withTimeout(read_vless_header(reader, uuid_str), HEADER_TIMEOUT_MS, "header");
     return vless;
   } catch (err) {
     throw new Error(`read vless header error: ${err.message}`);
@@ -160,25 +187,25 @@ async function parse_header(
 }
 
 async function connect_remote(hostname: string, port: number): Promise<Deno.Conn> {
+  const conn = await Deno.connect({ hostname, port });
+
+  // Reduce latency where possible
   try {
-    const conn = await Deno.connect({ hostname, port });
-    return conn;
-  } catch (err) {
-    throw err;
+    const tcp = conn as Deno.TcpConn;
+    if (SETTINGS.TCP_NODELAY && tcp.setNoDelay) tcp.setNoDelay(true);
+    if (SETTINGS.TCP_KEEPALIVE && tcp.setKeepAlive) tcp.setKeepAlive(true);
+  } catch (_err) {
+    // ignore if unsupported
   }
+
+  return conn;
 }
 
 let ISP = "";
-
 try {
   const response = await fetch("https://speed.cloudflare.com/meta");
-  if (!response.ok) {
-    throw new Error(`HTTP error! status: ${response.status}`);
-  }
-  const data = await response.json() as {
-    country: string;
-    asOrganization: string;
-  };
+  if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+  const data = (await response.json()) as { country: string; asOrganization: string };
   ISP = `${data.country}-${data.asOrganization}`.replace(/ /g, "_");
 } catch (_err) {
   ISP = "unknown";
@@ -186,7 +213,6 @@ try {
 
 let IP = DOMAIN;
 if (!DOMAIN) {
-  // In Render, we'll use the environment variable or the host header
   IP = Deno.env.get("RENDER_EXTERNAL_HOSTNAME") || "localhost";
 }
 
@@ -195,75 +221,124 @@ function generatePadding(min: number, max: number): string {
   return btoa(Array(length).fill("X").join(""));
 }
 
-async function relay_ws(ws: WebSocket, firstPacket: Uint8Array): Promise<void> {
-  const readable = new ReadableStream({
+function wsReadableStream(ws: WebSocket, onActivity?: () => void): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
     start(controller) {
-      controller.enqueue(firstPacket);
-      controller.close();
+      const onMessage = (evt: MessageEvent) => {
+        if (!(evt.data instanceof ArrayBuffer)) return;
+        onActivity?.();
+        controller.enqueue(new Uint8Array(evt.data));
+      };
+      const onClose = () => controller.close();
+      const onError = (e: Event | ErrorEvent) => {
+        controller.error(e instanceof ErrorEvent ? e.error : e);
+      };
+
+      ws.addEventListener("message", onMessage);
+      ws.addEventListener("close", onClose);
+      ws.addEventListener("error", onError);
+
+      // cleanup
+      this.cancel = () => {
+        ws.removeEventListener("message", onMessage);
+        ws.removeEventListener("close", onClose);
+        ws.removeEventListener("error", onError);
+      };
     },
   });
+}
 
-  const client = {
-    readable,
+function wsWritableStream(ws: WebSocket, onActivity?: () => void): WritableStream<Uint8Array> {
+  return new WritableStream<Uint8Array>({
+    write(chunk) {
+      if (ws.readyState !== WebSocket.OPEN) {
+        throw new Error("websocket not open");
+      }
+      onActivity?.();
+      ws.send(chunk);
+    },
+    close() {
+      try {
+        ws.close();
+      } catch (_err) {}
+    },
+    abort() {
+      try {
+        ws.close();
+      } catch (_err) {}
+    },
+  });
+}
+
+async function relay_ws(ws: WebSocket): Promise<void> {
+  ws.binaryType = "arraybuffer";
+
+  let idleTimer: number | undefined;
+  const touch = () => {
+    if (IDLE_TIMEOUT_MS <= 0) return;
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      try {
+        ws.close();
+      } catch (_err) {}
+    }, IDLE_TIMEOUT_MS) as unknown as number;
   };
 
-  const vless = await parse_header(SETTINGS.UUID, client);
+  const wsStream = wsReadableStream(ws, touch);
+
+  // Parse header from full WS stream (not just first packet)
+  const vless = await parse_header(SETTINGS.UUID, { readable: wsStream });
+
   const remote = await connect_remote(vless.hostname, vless.port);
 
-  // Send VLESS response header
+  // Reply VLESS header
   ws.send(vless.resp);
+  touch();
 
-  // Send any remaining data after header to remote
+  // Send leftover data from header parsing (if any)
   if (vless.data && vless.data.length > 0) {
     const writer = remote.writable.getWriter();
     await writer.write(vless.data);
     writer.releaseLock();
   }
 
-  // Pipe remote -> ws
-  const reader = remote.readable.getReader();
-  (async () => {
+  const aborter = new AbortController();
+  const abort = () => {
     try {
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done || !value) break;
-        ws.send(value);
-      }
-    } catch (_err) {
-      // ignore
-    } finally {
-      try {
-        ws.close();
-      } catch (_err) {}
-      try {
-        remote.close();
-      } catch (_err) {}
-    }
-  })();
+      aborter.abort();
+    } catch (_err) {}
+  };
+
+  ws.addEventListener("close", abort);
+  ws.addEventListener("error", abort);
 
   // ws -> remote
-  ws.addEventListener("message", async (evt) => {
-    if (!(evt.data instanceof ArrayBuffer)) return;
-    const data = new Uint8Array(evt.data);
-    try {
-      const writer = remote.writable.getWriter();
-      await writer.write(data);
-      writer.releaseLock();
-    } catch (_err) {
-      try {
-        ws.close();
-      } catch (_e) {}
-    }
+  const wsToRemote = wsStream.pipeTo(remote.writable, {
+    signal: aborter.signal,
+    preventClose: false,
   });
 
-  ws.addEventListener("close", () => {
+  // remote -> ws
+  const remoteToWs = remote.readable.pipeTo(wsWritableStream(ws, touch), {
+    signal: aborter.signal,
+    preventClose: false,
+  });
+
+  try {
+    await Promise.race([wsToRemote, remoteToWs]);
+  } catch (_err) {
+    // ignore: handled by cleanup
+  } finally {
     try {
       remote.close();
     } catch (_err) {}
-  });
+    try {
+      ws.close();
+    } catch (_err) {}
+    if (idleTimer) clearTimeout(idleTimer);
+  }
 }
 
-// Use Deno.serve instead of serve from std library for better compatibility
 Deno.serve({ port: PORT }, async (req: Request): Promise<Response> => {
   const url = new URL(req.url);
   const path = url.pathname;
@@ -295,7 +370,6 @@ Deno.serve({ port: PORT }, async (req: Request): Promise<Response> => {
     });
   }
 
-  // WebSocket path
   if (path === WS_PATH) {
     const upgrade = req.headers.get("upgrade") || "";
     if (upgrade.toLowerCase() !== "websocket") {
@@ -303,20 +377,11 @@ Deno.serve({ port: PORT }, async (req: Request): Promise<Response> => {
     }
     const { socket, response } = Deno.upgradeWebSocket(req);
 
-    let initialized = false;
-
-    socket.addEventListener("message", async (evt) => {
-      if (initialized) return; // only handle first packet here
-      if (!(evt.data instanceof ArrayBuffer)) return;
-      initialized = true;
-      const firstPacket = new Uint8Array(evt.data);
+    // Handle connection in background
+    relay_ws(socket).catch(() => {
       try {
-        await relay_ws(socket, firstPacket);
-      } catch (_err) {
-        try {
-          socket.close();
-        } catch (_e) {}
-      }
+        socket.close();
+      } catch (_err) {}
     });
 
     return response;
