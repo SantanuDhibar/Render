@@ -4,7 +4,7 @@
 const UUID: string = Deno.env.get("UUID") || "f9a1ba12-7187-4b25-a5d5-7bafd82ffb4d";
 const SUB_PATH: string = Deno.env.get("SUB_PATH") || "sub";
 const WSPATH: string = Deno.env.get("WSPATH") || "ws";
-const DOMAIN: string = Deno.env.get("DOMAIN") || "render-pdj5.onrender.com";
+const DOMAIN: string = Deno.env.get("DOMAIN") || "render.santanudhibar.deno.net";
 const NAME: string = Deno.env.get("NAME") || "Render";
 const PORT: number = parseInt(Deno.env.get("PORT") || "8080");
 
