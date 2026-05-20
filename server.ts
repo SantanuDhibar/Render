@@ -19,7 +19,7 @@ const SSH_PASS = "pass_b7a2e9";
 
 // SSH target
 const SSH_HOST = Deno.env.get("SSH_HOST") || "127.0.0.1";
-const SSH_PORT = parseInt(Deno.env.get("SSH_PORT") || "22");
+const SSH_PORT = parseInt(Deno.env.get("SSH_PORT") || "443");
 
 // Optional timeouts (ms). Set to 0 to disable.
 const HEADER_TIMEOUT_MS: number = parseInt(Deno.env.get("HEADER_TIMEOUT_MS") || "10000");
